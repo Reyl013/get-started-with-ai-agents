@@ -16,6 +16,8 @@ import { MenuButton } from "../core/MenuButton/MenuButton";
 import { IChatItem } from "./chatbot/types";
 import { Waves } from "./Waves";
 import { BuiltWithBadge } from "./BuiltWithBadge";
+import { AgentSelector } from "./AgentSelector";
+
 
 import styles from "./AgentPreview.module.css";
 
@@ -77,10 +79,11 @@ const preprocessContent = (
 };
 
 export function AgentPreview({ agentDetails }: IAgentPreviewProps): ReactNode {
+  const [agentId, setAgentId] = useState("general");
   const [isSettingsPanelOpen, setIsSettingsPanelOpen] = useState(false);
   const [messageList, setMessageList] = useState<IChatItem[]>([]);
   const [isResponding, setIsResponding] = useState(false);
-  const [isLoadingChatHistory, setIsLoadingChatHistory] = useState(true);
+  const [isLoadingChatHistory, setIsLoadingChatHistory] = useState(false);
 
   const loadChatHistory = async () => {
     try {
@@ -145,9 +148,14 @@ export function AgentPreview({ agentDetails }: IAgentPreviewProps): ReactNode {
     }
   };
 
-  useEffect(() => {
+  
+const SHOW_CHAT_HISTORY_ON_LOAD = false;
+useEffect(() => {
+  if (SHOW_CHAT_HISTORY_ON_LOAD) {
     loadChatHistory();
-  }, []);
+  }
+}, []);
+
 
   const handleSettingsPanelOpenChange = (isOpen: boolean) => {
     setIsSettingsPanelOpen(isOpen);
@@ -179,7 +187,7 @@ export function AgentPreview({ agentDetails }: IAgentPreviewProps): ReactNode {
     setMessageList((prev) => [...prev, userMessage]);
 
     try {
-      const postData = { message: message };
+      const postData = { message: message, agentId: agentId };
       // IMPORTANT: Add credentials: 'include' if server cookies are critical
       // and if your backend is on the same domain or properly configured for cross-site cookies.
 
@@ -503,6 +511,17 @@ export function AgentPreview({ agentDetails }: IAgentPreviewProps): ReactNode {
           >
             New Chat
           </Button>
+          
+<div style={{ minWidth: 220, marginLeft: 8 }}>
+    <AgentSelector value={agentId} onChange=
+{(newAgentId) => {
+    setAgentId(newAgentId);
+    newThread();          // ✅ clears cookies & resets server thread
+    setMessageList([]);   // ✅ clears UI messages right away
+  }}
+ />
+  </div>
+
           <MenuButton
             menuButtonText=""
             menuItems={menuItems}

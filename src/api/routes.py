@@ -33,6 +33,16 @@ from azure.ai.projects.models import (
 )
 
 
+# Map UI keys -> real Agent IDs from env
+
+AGENT_ID_MAP = {
+    "general": "asst_ocL66MqmyPVqoRqbpxzFDkey",
+    "kb":      "asst_TyHSfi7X0ICCZKzFAiwqG7nB",
+    "coder":   "asst_150KwUYsMWRzwabCIoNRPYtr",
+}
+
+
+
 # Create a logger for this module
 logger = logging.getLogger("azureaiapp")
 
@@ -97,28 +107,72 @@ def get_app_insights_conn_str(request: Request) -> str:
 def serialize_sse_event(data: Dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
-async def get_message_and_annotations(agent_client : AgentsClient, message: ThreadMessage) -> Dict:
-    annotations = []
-    # Get file annotations for the file search.
-    for annotation in (a.as_dict() for a in message.file_citation_annotations):
-        file_id = annotation["file_citation"]["file_id"]
-        logger.info(f"Fetching file with ID for annotation {file_id}")
-        openai_file = await agent_client.files.get(file_id)
-        annotation["file_name"] = openai_file.filename
-        logger.info(f"File name for annotation: {annotation['file_name']}")
-        annotations.append(annotation)
 
-    # Get url annotation for the index search.
-    for url_annotation in message.url_citation_annotations:
-        annotation = url_annotation.as_dict()
-        annotation["file_name"] = annotation['url_citation']['title']
-        logger.info(f"File name for annotation: {annotation['file_name']}")
-        annotations.append(annotation)
-            
+async def get_message_and_annotations(agent_client: AgentsClient, message: ThreadMessage) -> Dict:
+    annotations = []
+
+    # ---- File citations (guard None)
+    file_citations = getattr(message, "file_citation_annotations", None) or []
+    for fc in file_citations:
+        ann = fc.as_dict()
+        file_id = ann.get("file_citation", {}).get("file_id")
+        if file_id:
+            try:
+                openai_file = await agent_client.files.get(file_id)
+                ann["file_name"] = getattr(openai_file, "filename", "")
+            except Exception as e:
+                logger.warning(f"Failed to fetch file {file_id}: {e}")
+        annotations.append(ann)
+
+    # ---- URL citations (guard None)
+    url_citations = getattr(message, "url_citation_annotations", None) or []
+    for uc in url_citations:
+        ann = uc.as_dict()
+        ann["file_name"] = ann.get("url_citation", {}).get("title", "") or ""
+        annotations.append(ann)
+
+    # ---- Robust content extraction with fallbacks
+    content_text = ""
+
+    # Try message.text_messages[0].text.value
+    try:
+        texts = getattr(message, "text_messages", None)
+        if texts and len(texts) > 0:
+            t0 = texts[0]
+            content_text = getattr(getattr(t0, "text", None), "value", "") or ""
+    except Exception as e:
+        logger.debug(f"text_messages parse failed: {e}")
+
+    # Fallback: message.content parts (first text part)
+    if not content_text:
+        try:
+            parts = getattr(message, "content", None) or []
+            for p in parts:
+                txt = getattr(p, "text", None)
+                if txt and getattr(txt, "value", None):
+                    content_text = txt.value
+                    break
+        except Exception as e:
+            logger.debug(f"content parts parse failed: {e}")
+
+    # Last resort: stringify dict content
+    if not content_text:
+        try:
+            mdict = message.as_dict()
+            raw = mdict.get("content", "")
+            if isinstance(raw, str):
+                content_text = raw
+            else:
+                content_text = json.dumps(raw)
+        except Exception as e:
+            logger.debug(f"as_dict fallback failed: {e}")
+            content_text = ""
+
     return {
-        'content': message.text_messages[0].text.value,
-        'annotations': annotations
+        "content": content_text,   # guaranteed string (possibly empty)
+        "annotations": annotations
     }
+
 
 class MyEventHandler(AsyncAgentEventHandler[str]):
     def __init__(self, ai_project: AIProjectClient, app_insights_conn_str: str):
@@ -127,9 +181,13 @@ class MyEventHandler(AsyncAgentEventHandler[str]):
         self.ai_project = ai_project
         self.app_insights_conn_str = app_insights_conn_str
 
+    
     async def on_message_delta(self, delta: MessageDeltaChunk) -> Optional[str]:
-        stream_data = {'content': delta.text, 'type': "message"}
-        return serialize_sse_event(stream_data)
+         # Always send a string (empty string if not present)
+         chunk_text = getattr(delta, "text", "") or ""
+         stream_data = {"content": chunk_text, "type": "message"}
+         return serialize_sse_event(stream_data)
+
 
     async def on_thread_message(self, message: ThreadMessage) -> Optional[str]:
         try:
@@ -223,22 +281,20 @@ async def get_result(
             yield serialize_sse_event({'type': "error", 'message': str(e)})
 
 
+
 @router.get("/chat/history")
 async def history(
     request: Request,
-    ai_project : AIProjectClient = Depends(get_ai_project),
-    agent : Agent = Depends(get_agent),
-	_ = auth_dependency
+    ai_project: AIProjectClient = Depends(get_ai_project),
+    agent: Agent = Depends(get_agent),
+    _ = auth_dependency
 ):
     with tracer.start_as_current_span("chat_history"):
-        # Retrieve the thread ID from the cookies (if available).
-        thread_id = request.cookies.get('thread_id')
-        agent_id = request.cookies.get('agent_id')
+        thread_id = request.cookies.get("thread_id")
 
-        # Attempt to get an existing thread. If not found, create a new one.
         try:
             agent_client = ai_project.agents
-            if thread_id and agent_id == agent.id:
+            if thread_id:
                 logger.info(f"Retrieving thread with ID {thread_id}")
                 thread = await agent_client.threads.get(thread_id)
             else:
@@ -249,31 +305,24 @@ async def history(
             raise HTTPException(status_code=400, detail=f"Error handling thread: {e}")
 
         thread_id = thread.id
-        agent_id = agent.id
 
-    # Create a new message from the user's input.
     try:
         content = []
-        response = agent_client.messages.list(
-            thread_id=thread_id,
-        )
-        async for message in response:
-            formatteded_message = await get_message_and_annotations(agent_client, message)
-            formatteded_message['role'] = message.role
-            formatteded_message['created_at'] = message.created_at.astimezone().strftime("%m/%d/%y, %I:%M %p")
-            content.append(formatteded_message)
-                
-                                        
+        response_iter = agent_client.messages.list(thread_id=thread_id)
+        async for message in response_iter:
+            formatted = await get_message_and_annotations(agent_client, message)
+            formatted["role"] = message.role
+            formatted["created_at"] = message.created_at.astimezone().strftime("%m/%d/%y, %I:%M %p")
+            content.append(formatted)
+
         logger.info(f"List message, thread ID: {thread_id}")
         response = JSONResponse(content=content)
-    
-        # Update cookies to persist the thread and agent IDs.
-        response.set_cookie("thread_id", thread_id)
-        response.set_cookie("agent_id", agent_id)
+        response.set_cookie("thread_id", thread_id)  # keep only thread here
         return response
     except Exception as e:
         logger.error(f"Error listing message: {e}")
         raise HTTPException(status_code=500, detail=f"Error list message: {e}")
+
 
 @router.get("/agent")
 async def get_chat_agent(
@@ -281,74 +330,87 @@ async def get_chat_agent(
 ):
     return JSONResponse(content=get_agent(request).as_dict())  
 
+
 @router.post("/chat")
 async def chat(
     request: Request,
-    agent : Agent = Depends(get_agent),
+    agent: Agent = Depends(get_agent),
     ai_project: AIProjectClient = Depends(get_ai_project),
-    app_insights_conn_str : str = Depends(get_app_insights_conn_str),
-	_ = auth_dependency
+    app_insights_conn_str: str = Depends(get_app_insights_conn_str),
+    _ = auth_dependency
 ):
-    # Retrieve the thread ID from the cookies (if available).
-    thread_id = request.cookies.get('thread_id')
-    agent_id = request.cookies.get('agent_id')
+    # Cookies from previous requests
+    cookie_thread_id = request.cookies.get("thread_id")
+    cookie_agent_id  = request.cookies.get("agent_id")
 
     with tracer.start_as_current_span("chat_request"):
-        carrier = {}        
+        carrier = {}
         TraceContextTextMapPropagator().inject(carrier)
-        
-        # Attempt to get an existing thread. If not found, create a new one.
+
+        # Parse body { message, agentId }
+        try:
+            body = await request.json()
+            user_message: str = body.get("message", "")
+            agent_key:   str = body.get("agentId", "general")
+        except Exception as e:
+            logger.error(f"Invalid JSON in request: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid JSON in request: {e}")
+
+        logger.info(f"user_message payload: {body}")
+
+        # Map dropdown key -> real Foundry Agent ID from env
+        assistant_id = AGENT_ID_MAP.get(agent_key)
+        if not assistant_id:
+            logger.error(f"Unknown agentId '{agent_key}' or missing env var")
+            raise HTTPException(status_code=400, detail=f"Unknown agentId '{agent_key}' or missing env var")
+
+        # Get or create thread (fresh if agent changed)
         try:
             agent_client = ai_project.agents
-            if thread_id and agent_id == agent.id:
-                logger.info(f"Retrieving thread with ID {thread_id}")
-                thread = await agent_client.threads.get(thread_id)
+            if cookie_thread_id and cookie_agent_id == assistant_id:
+                logger.info(f"Reusing thread {cookie_thread_id} for agent {assistant_id}")
+                thread = await agent_client.threads.get(cookie_thread_id)
             else:
-                logger.info("Creating a new thread")
+                logger.info("Creating a new thread (agent selection changed or first run)")
                 thread = await agent_client.threads.create()
         except Exception as e:
             logger.error(f"Error handling thread: {e}")
             raise HTTPException(status_code=400, detail=f"Error handling thread: {e}")
 
         thread_id = thread.id
-        agent_id = agent.id
 
-        # Parse the JSON from the request.
+        # Create the user's message (IMPORTANT: pass the string, not .get(...))
         try:
-            user_message = await request.json()
-        except Exception as e:
-            logger.error(f"Invalid JSON in request: {e}")
-            raise HTTPException(status_code=400, detail=f"Invalid JSON in request: {e}")
-
-        logger.info(f"user_message: {user_message}")
-
-        # Create a new message from the user's input.
-        try:
-            message = await agent_client.messages.create(
+            msg = await agent_client.messages.create(
                 thread_id=thread_id,
                 role="user",
-                content=user_message.get('message', '')
+                content=user_message
             )
-            logger.info(f"Created message, message ID: {message.id}")
+            logger.info(f"Created message, message ID: {msg.id}")
         except Exception as e:
             logger.error(f"Error creating message: {e}")
             raise HTTPException(status_code=500, detail=f"Error creating message: {e}")
 
-        # Set the Server-Sent Events (SSE) response headers.
+        # SSE headers
         headers = {
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "Content-Type": "text/event-stream"
+            "Content-Type": "text/event-stream",
         }
-        logger.info(f"Starting streaming response for thread ID {thread_id}")
 
-        # Create the streaming response using the generator.
-        response = StreamingResponse(get_result(request, thread_id, agent_id, ai_project, app_insights_conn_str, carrier), headers=headers)
+        logger.info(f"Starting streaming response for thread ID {thread_id} with assistant {assistant_id}")
 
-        # Update cookies to persist the thread and agent IDs.
+        # Stream via existing helper (uses Agents SDK runs.stream(thread_id, agent_id=...))
+        response = StreamingResponse(
+            get_result(request, thread_id, assistant_id, ai_project, app_insights_conn_str, carrier),
+            headers=headers,
+        )
+
+        # Persist thread + the selected agent id
         response.set_cookie("thread_id", thread_id)
-        response.set_cookie("agent_id", agent_id)
+        response.set_cookie("agent_id", assistant_id)
         return response
+
 
 def read_file(path: str) -> str:
     with open(path, 'r') as file:
